@@ -498,7 +498,7 @@
 <section class="page">
   <header class="header">
     <h1>utf8.lol</h1>
-    <p class="intro">pick from a larger bank, load common spinners, add your own frames, and preview the result.</p>
+    <p class="intro">make the text go round and round. <a href="https://github.com/nakajima/utf8.lol">view source</a></p>
   </header>
 
   <section class="preview-row">
@@ -589,7 +589,7 @@
       </div>
 
       <textarea bind:value={framesText} spellcheck="false"></textarea>
-      <p class="section-note">load a common spinner, then edit one frame per line.</p>
+      <p class="section-note">one frame per line.</p>
       <div class="filter-list">
         {#each presetFilters as filter}
           <button
