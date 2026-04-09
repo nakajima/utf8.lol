@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte'
+  import { onDestroy, onMount } from 'svelte'
   import { cliSpinnerPresets, cliSpinnerSourceUrl, type CliSpinnerPreset } from './lib/cliSpinners'
 
   type BankCategoryId =
@@ -345,8 +345,10 @@
   let safeInterval = starterPreset.interval
   let previewIndex = 0
   let activeFrame = starterFrames[0] ?? ''
-  let isPlaying = true
+  let wantsToPlay = true
   let timer: ReturnType<typeof setInterval> | null = null
+  let presetClock = 0
+  let presetTimer: ReturnType<typeof setInterval> | null = null
 
   function parseFrames(value: string) {
     return value
@@ -425,12 +427,34 @@
     }
   }
 
-  function togglePlay() {
-    if (frames.length < 2) {
-      return
+  function clearPresetTimer() {
+    if (presetTimer) {
+      clearInterval(presetTimer)
+      presetTimer = null
+    }
+  }
+
+  function getPresetFrame(preset: CliSpinnerPreset, clock: number) {
+    if (preset.frames.length === 0) {
+      return ''
     }
 
-    isPlaying = !isPlaying
+    return preset.frames[Math.floor(clock / Math.max(10, preset.interval)) % preset.frames.length]
+  }
+
+  onMount(() => {
+    presetClock = Date.now()
+    presetTimer = setInterval(() => {
+      presetClock = Date.now()
+    }, 40)
+
+    return () => {
+      clearPresetTimer()
+    }
+  })
+
+  function togglePlay() {
+    wantsToPlay = !wantsToPlay
   }
 
   $: frames = parseFrames(framesText)
@@ -446,9 +470,6 @@
       ? presetSpinners
       : presetSpinners.filter((preset) => preset.category === selectedPresetCategory)
   $: safeInterval = Number.isFinite(intervalMs) ? Math.max(10, intervalMs) : starterPreset.interval
-  $: if (frames.length < 2) {
-    isPlaying = false
-  }
   $: if (frames.length === 0) {
     previewIndex = 0
   }
@@ -456,7 +477,7 @@
   $: {
     clearTimer()
 
-    if (isPlaying && frames.length > 1) {
+    if (wantsToPlay && frames.length > 1) {
       const frameCount = frames.length
       timer = setInterval(() => {
         previewIndex = (previewIndex + 1) % frameCount
@@ -464,16 +485,19 @@
     }
   }
 
-  onDestroy(clearTimer)
+  onDestroy(() => {
+    clearTimer()
+    clearPresetTimer()
+  })
 </script>
 
 <svelte:head>
-  <title>ascii spinner builder</title>
+  <title>utf8.lol</title>
 </svelte:head>
 
 <section class="page">
   <header class="header">
-    <h1>ascii spinner builder</h1>
+    <h1>utf8.lol</h1>
     <p class="intro">pick from a larger bank, load common spinners, add your own frames, and preview the result.</p>
   </header>
 
@@ -491,8 +515,8 @@
     </div>
 
     <div class="preview-controls">
-      <button type="button" onclick={togglePlay} disabled={frames.length < 2}>
-        {isPlaying ? 'pause' : 'play'}
+      <button type="button" onclick={togglePlay}>
+        {wantsToPlay ? 'pause' : 'play'}
       </button>
 
       <label class="field speed-field">
@@ -503,7 +527,7 @@
   </section>
 
   <section class="layout">
-    <div class="panel">
+    <div class="panel bank-panel">
       <div class="section-head">
         <h2>character bank</h2>
       </div>
@@ -555,7 +579,7 @@
       </form>
     </div>
 
-    <div class="panel">
+    <div class="panel frames-panel">
       <div class="section-head">
         <h2>frames</h2>
         <div class="actions">
@@ -566,11 +590,6 @@
 
       <textarea bind:value={framesText} spellcheck="false"></textarea>
       <p class="section-note">load a common spinner, then edit one frame per line.</p>
-      <p class="section-note attribution">
-        From
-        <a href={cliSpinnerSourceUrl} target="_blank" rel="noreferrer">sindresorhus/cli-spinners</a>.
-      </p>
-
       <div class="filter-list">
         {#each presetFilters as filter}
           <button
@@ -589,12 +608,19 @@
           <button
             type="button"
             class:selected={frameSignature === preset.frames.join('\n')}
+            aria-label={`load preset ${preset.name}`}
+            title={preset.name}
             onclick={() => loadPreset(preset)}
           >
-            {preset.name}
+            <span class="preset-preview" aria-hidden="true">{getPresetFrame(preset, presetClock)}</span>
           </button>
         {/each}
       </div>
+      <p class="section-note attribution">
+        Presets from
+        <a href={cliSpinnerSourceUrl} target="_blank" rel="noreferrer">sindresorhus/cli-spinners</a>.
+      </p>
+
 
     </div>
   </section>
@@ -704,27 +730,60 @@
   }
 
   .filter-list,
-  .character-list,
-  .preset-list {
+  .character-list {
     display: flex;
     flex-wrap: wrap;
     gap: 0.5rem;
     margin: 1rem 0 0;
   }
 
-  .character-list,
   .preset-list {
-    margin-bottom: 1.25rem;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(4.5rem, 1fr));
+    gap: 0.5rem;
+    margin: 1rem 0 1.25rem;
   }
 
   .filter-list button,
-  .character-list button,
-  .preset-list button {
+  .character-list button {
     white-space: pre;
   }
 
   .character-list button {
     min-width: 3rem;
+  }
+
+  .preset-list button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 3rem;
+    padding: 0.75rem;
+    white-space: pre;
+    overflow: hidden;
+    color: var(--muted);
+    border-color: color-mix(in oklch, var(--border) 45%, transparent);
+  }
+
+  .preset-list button:hover,
+  .preset-list button.selected {
+    color: var(--text);
+    border-color: var(--text);
+  }
+
+  .preset-preview {
+    display: block;
+    max-width: 100%;
+    overflow: hidden;
+    font-size: 1.125rem;
+    line-height: 1;
+    text-overflow: clip;
+    opacity: 0.8;
+  }
+
+  .preset-list button:hover .preset-preview,
+  .preset-list button.selected .preset-preview {
+    opacity: 1;
   }
 
   .filter-list button.selected,
@@ -759,20 +818,29 @@
       grid-template-columns: 1fr;
     }
 
+    .frames-panel {
+      order: -1;
+    }
+
     .preview {
       font-size: 2.5rem;
     }
 
     .section-head,
-    .preview-controls,
     .inline-field {
       align-items: flex-start;
       flex-direction: column;
     }
 
+    .preview-controls {
+      align-items: end;
+      flex-direction: row;
+      flex-wrap: nowrap;
+    }
+
     .speed-field {
-      min-width: 0;
-      width: 100%;
+      min-width: 10rem;
+      width: auto;
     }
   }
 </style>
