@@ -1,0 +1,92 @@
+:root {
+  --bg: oklch(2% 0.063 246);
+  --text: oklch(98% 0 246);
+  --muted: oklch(50% 0.029 246);
+  --border: oklch(26% 0.046 246);
+  --surface: #1a1a1a;
+  --font:
+    ui-monospace, "SFMono-Regular", "SF Mono", Consolas, "Liberation Mono",
+    Menlo, monospace;
+
+  color-scheme: light dark;
+  font-family: var(--font);
+  line-height: 1.4;
+  font-weight: 400;
+  color: var(--text);
+  background: var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+}
+
+body,
+button,
+input,
+textarea {
+  font-family: var(--font);
+  font-size: 16px;
+}
+
+button,
+input,
+textarea {
+  color: inherit;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 0;
+}
+
+button {
+  padding: 0.5rem 0.75rem;
+  cursor: pointer;
+}
+
+button:hover {
+  background: var(--surface);
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
+  outline: 1px solid var(--text);
+  outline-offset: 1px;
+}
+
+input,
+textarea {
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+}
+
+textarea {
+  resize: vertical;
+}
+
+#app {
+  max-width: 72rem;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+::selection {
+  background: var(--text);
+  color: var(--bg);
+}
