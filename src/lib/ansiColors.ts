@@ -172,6 +172,144 @@ export const xtermAnsiColorOptions: AnsiColorOption[] = Array.from({ length: 256
   .map(({ red: _, green: __, blue: ___, ...option }) => option)
 
 const ansiColorsById = new Map([...basicAnsiColorOptions, ...xtermAnsiColorOptions].map((color) => [color.id, color]))
+const ansiSgrPattern = /(?:\u001b\[|\u009b)([0-9;]*)m/g
+
+const basicColorIdsByCode = new Map<number, BasicAnsiColorId>([
+  [30, 'black'],
+  [31, 'red'],
+  [32, 'green'],
+  [33, 'yellow'],
+  [34, 'blue'],
+  [35, 'magenta'],
+  [36, 'cyan'],
+  [37, 'white'],
+  [90, 'gray'],
+  [91, 'brightRed'],
+  [92, 'brightGreen'],
+  [93, 'brightYellow'],
+  [94, 'brightBlue'],
+  [95, 'brightMagenta'],
+  [96, 'brightCyan'],
+  [97, 'brightWhite'],
+])
+
+export function getAnsiColorOption(colorId: AnsiColorId) {
+  return ansiColorsById.get(colorId) ?? null
+}
+
+function getClosestXtermColorId(red: number, green: number, blue: number): AnsiColorId {
+  let closestColorId: AnsiColorId = 'xterm0'
+  let closestDistance = Number.POSITIVE_INFINITY
+
+  for (let index = 0; index < 256; index += 1) {
+    const candidate = getXtermRgb(index)
+    const distance =
+      (candidate.red - red) ** 2 +
+      (candidate.green - green) ** 2 +
+      (candidate.blue - blue) ** 2
+
+    if (distance < closestDistance) {
+      closestColorId = `xterm${index}`
+      closestDistance = distance
+    }
+  }
+
+  return closestColorId
+}
+
+function applySgrCodes(colorId: AnsiColorId | null, sgrCodes: number[]) {
+  let nextColorId = colorId
+
+  for (let index = 0; index < sgrCodes.length; index += 1) {
+    const code = sgrCodes[index] ?? 0
+
+    if (code === 0 || code === 39) {
+      nextColorId = null
+      continue
+    }
+
+    const basicColorId = basicColorIdsByCode.get(code)
+
+    if (basicColorId) {
+      nextColorId = basicColorId
+      continue
+    }
+
+    if (code === 38) {
+      const mode = sgrCodes[index + 1]
+
+      if (mode === 5) {
+        const paletteIndex = Math.max(0, Math.min(255, sgrCodes[index + 2] ?? 0))
+        nextColorId = `xterm${paletteIndex}`
+        index += 2
+        continue
+      }
+
+      if (mode === 2) {
+        const red = Math.max(0, Math.min(255, sgrCodes[index + 2] ?? 0))
+        const green = Math.max(0, Math.min(255, sgrCodes[index + 3] ?? 0))
+        const blue = Math.max(0, Math.min(255, sgrCodes[index + 4] ?? 0))
+        nextColorId = getClosestXtermColorId(red, green, blue)
+        index += 4
+      }
+    }
+  }
+
+  return nextColorId
+}
+
+export function containsAnsiSgr(value: string) {
+  ansiSgrPattern.lastIndex = 0
+  return ansiSgrPattern.test(value)
+}
+
+export function parseAnsiText(value: string) {
+  ansiSgrPattern.lastIndex = 0
+
+  let plainText = ''
+  let activeColorId: AnsiColorId | null = null
+  let coloredSpanStart = 0
+  let lastIndex = 0
+  const spans: ColorSpan[] = []
+
+  for (const match of value.matchAll(ansiSgrPattern)) {
+    const matchIndex = match.index ?? 0
+    plainText += value.slice(lastIndex, matchIndex)
+
+    if (activeColorId && plainText.length > coloredSpanStart) {
+      spans.push({
+        start: coloredSpanStart,
+        end: plainText.length,
+        colorId: activeColorId,
+      })
+    }
+
+    const sgrCodes = (match[1] ?? '')
+      .split(';')
+      .filter((segment) => segment !== '')
+      .map((segment) => Number.parseInt(segment, 10))
+      .filter((segment) => Number.isFinite(segment))
+
+    activeColorId = applySgrCodes(activeColorId, sgrCodes.length > 0 ? sgrCodes : [0])
+    coloredSpanStart = plainText.length
+    lastIndex = matchIndex + match[0].length
+  }
+
+  plainText += value.slice(lastIndex)
+
+  if (activeColorId && plainText.length > coloredSpanStart) {
+    spans.push({
+      start: coloredSpanStart,
+      end: plainText.length,
+      colorId: activeColorId,
+    })
+  }
+
+  return {
+    text: plainText,
+    spans: normalizeColorSpans(spans),
+  }
+}
 
 function compareSpans(left: ColorSpan, right: ColorSpan) {
   if (left.start !== right.start) {

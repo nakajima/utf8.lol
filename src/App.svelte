@@ -5,6 +5,9 @@
     xtermAnsiColorOptions,
     applyColorToRange,
     buildStyledSegments,
+    containsAnsiSgr,
+    normalizeColorSpans,
+    parseAnsiText,
     shiftColorSpansForEdit,
     toAnsiString,
     type AnsiColorId,
@@ -49,7 +52,56 @@
     previousLength: number
   }
 
+  type EditorLine = {
+    text: string
+    start: number
+    end: number
+  }
+
+  type EditorSelectionPosition = {
+    lineIndex: number
+    column: number
+  }
+
+  type RectangularSelectionRow = {
+    lineIndex: number
+    start: number
+    end: number
+  }
+
+  type RectangularSelection = {
+    rows: RectangularSelectionRow[]
+    columnStart: number
+    columnEnd: number
+    anchorLineIndex: number
+    focusLineIndex: number
+  }
+
+  type RgbColor = {
+    red: number
+    green: number
+    blue: number
+  }
+
+  type EditorMetrics = {
+    charWidth: number
+    lineHeight: number
+  }
+
   type AnsiPaletteMode = '16' | '256'
+
+  type ShareState = {
+    version: 1
+    framesText: string
+    colorSpans: ColorSpan[]
+    intervalMs: number
+    ansiPaletteMode: AnsiPaletteMode
+  }
+
+  const fallbackEditorMetrics: EditorMetrics = {
+    charWidth: 8,
+    lineHeight: 22,
+  }
 
   const bankCategories: BankCategory[] = [
     {
@@ -321,6 +373,135 @@
     return ranges
   }
 
+  function parseEditorLines(value: string) {
+    const lines: EditorLine[] = []
+    let offset = 0
+
+    for (const rawLine of value.split('\n')) {
+      const line = rawLine.replace(/\r$/, '')
+      lines.push({
+        text: line,
+        start: offset,
+        end: offset + line.length,
+      })
+      offset += rawLine.length + 1
+    }
+
+    return lines
+  }
+
+  function getSelectionPositionAtOffset(lines: EditorLine[], offset: number, textLength: number): EditorSelectionPosition {
+    const safeOffset = Math.max(0, Math.min(offset, textLength))
+
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index]
+
+      if (safeOffset <= line.end || index === lines.length - 1) {
+        return {
+          lineIndex: index,
+          column: Math.max(0, Math.min(safeOffset - line.start, line.text.length)),
+        }
+      }
+    }
+
+    const fallback = lines.at(-1) ?? { text: '', start: 0, end: 0 }
+    return { lineIndex: Math.max(0, lines.length - 1), column: fallback.text.length }
+  }
+
+  function getOffsetAtSelectionPosition(lines: EditorLine[], position: EditorSelectionPosition) {
+    const safeLineIndex = Math.max(0, Math.min(position.lineIndex, lines.length - 1))
+    const line = lines[safeLineIndex] ?? { text: '', start: 0, end: 0 }
+    return line.start + Math.max(0, Math.min(position.column, line.text.length))
+  }
+
+  function buildRectangularSelection(
+    lines: EditorLine[],
+    startPosition: EditorSelectionPosition,
+    endPosition: EditorSelectionPosition,
+  ) {
+    const firstLineIndex = Math.min(startPosition.lineIndex, endPosition.lineIndex)
+    const lastLineIndex = Math.max(startPosition.lineIndex, endPosition.lineIndex)
+    const columnStart = Math.min(startPosition.column, endPosition.column)
+    const columnEnd = Math.max(startPosition.column, endPosition.column)
+
+    if (columnEnd <= columnStart) {
+      return null
+    }
+
+    const rows: RectangularSelectionRow[] = []
+
+    for (let lineIndex = firstLineIndex; lineIndex <= lastLineIndex; lineIndex += 1) {
+      const line = lines[lineIndex] ?? { text: '', start: 0, end: 0 }
+      const startOffset = line.start + Math.min(columnStart, line.text.length)
+      const endOffset = line.start + Math.min(columnEnd, line.text.length)
+      rows.push({ lineIndex, start: startOffset, end: endOffset })
+    }
+
+    return {
+      rows,
+      columnStart,
+      columnEnd,
+      anchorLineIndex: startPosition.lineIndex,
+      focusLineIndex: endPosition.lineIndex,
+    }
+  }
+
+  function getRectangularSelection(value: string, start: number, end: number) {
+    if (start === end) {
+      return null
+    }
+
+    const lines = parseEditorLines(value)
+    return buildRectangularSelection(
+      lines,
+      getSelectionPositionAtOffset(lines, start, value.length),
+      getSelectionPositionAtOffset(lines, end, value.length),
+    )
+  }
+
+  function parseHexColor(value: string): RgbColor {
+    const normalized = value.startsWith('#') ? value.slice(1) : value
+
+    if (normalized.length !== 6) {
+      return { red: 255, green: 255, blue: 255 }
+    }
+
+    return {
+      red: Number.parseInt(normalized.slice(0, 2), 16),
+      green: Number.parseInt(normalized.slice(2, 4), 16),
+      blue: Number.parseInt(normalized.slice(4, 6), 16),
+    }
+  }
+
+  function interpolateRgbColor(start: RgbColor, end: RgbColor, factor: number): RgbColor {
+    return {
+      red: Math.round(start.red + (end.red - start.red) * factor),
+      green: Math.round(start.green + (end.green - start.green) * factor),
+      blue: Math.round(start.blue + (end.blue - start.blue) * factor),
+    }
+  }
+
+  function getClosestPaletteColorId(target: RgbColor, palette: AnsiColorOption[]) {
+    const fallback = palette[0] ?? basicAnsiColorOptions[0]
+    let closestColorId = fallback.id
+    let closestDistance = Number.POSITIVE_INFINITY
+
+    for (const option of palette) {
+      const candidate = parseHexColor(option.cssColor)
+      const distance =
+        (candidate.red - target.red) ** 2 +
+        (candidate.green - target.green) ** 2 +
+        (candidate.blue - target.blue) ** 2
+
+      if (distance < closestDistance) {
+        closestColorId = option.id
+        closestDistance = distance
+      }
+    }
+
+    return closestColorId
+  }
+
   function unique(values: string[]) {
     return [...new Set(values)]
   }
@@ -379,6 +560,7 @@
 
   let framesText = starterFrames.join('\n')
   let frameRanges: FrameRange[] = parseFrameRanges(framesText)
+  let editorLines: EditorLine[] = parseEditorLines(framesText)
   let frames: string[] = starterFrames
   let frameSignature = starterFrames.join('\n')
   let colorSpans: ColorSpan[] = []
@@ -389,7 +571,18 @@
   let selectedTextEnd = 0
   let selectedText = ''
   let selectionHasColorableText = false
-  let ansiPaletteMode: AnsiPaletteMode = '16'
+  let rectangularSelection: RectangularSelection | null = null
+  let rectangularSelectionCharacterCount = 0
+  let rectangularSelectionColumnCount = 0
+  let rectangularSelectionColorableRowCount = 0
+  let rectangularSelectionHasColorableText = false
+  let showSelectionTools = false
+  let canApplyFrameGradient = false
+  let gradientPickTarget: null = null
+  let selectedColorHex = '#06b6d4'
+  let gradientStartColorHex = '#06b6d4'
+  let gradientEndColorHex = '#e879f9'
+  let ansiPaletteMode: AnsiPaletteMode = '256'
   let visibleAnsiColorOptions: AnsiColorOption[] = basicAnsiColorOptions
   let customCharacters: string[] = []
   let selectedBankCategory: BankCategoryId = 'all'
@@ -408,9 +601,18 @@
   let presetTimer: ReturnType<typeof setInterval> | null = null
   let framesTextarea: HTMLTextAreaElement | null = null
   let framesOverlay: HTMLDivElement | null = null
+  let framesSelectionOverlay: HTMLDivElement | null = null
   let pendingTextEdit: PendingTextEdit | null = null
+  let customRectangularSelection: RectangularSelection | null = null
+  let rectangularSelectionDragAnchor: EditorSelectionPosition | null = null
+  let editorMetrics: EditorMetrics = fallbackEditorMetrics
+  let editorLongestLineLength = Math.max(...starterFrames.map((frame) => frame.length), 0)
+  let editorContentWidth = Math.max(1, editorLongestLineLength) * fallbackEditorMetrics.charWidth
+  let editorContentHeight = Math.max(1, starterFrames.length) * fallbackEditorMetrics.lineHeight
   let copyStatus = ''
   let copyTimer: ReturnType<typeof setTimeout> | null = null
+  let hasLoadedUrlState = false
+  let shareStateHash = ''
 
   function setFrames(nextFrames: string[]) {
     clearCopyTimer()
@@ -418,6 +620,7 @@
     colorSpans = []
     selectedTextStart = 0
     selectedTextEnd = 0
+    customRectangularSelection = null
     copyStatus = ''
 
     queueMicrotask(() => {
@@ -425,6 +628,7 @@
         framesTextarea.setSelectionRange(0, 0)
       }
 
+      measureEditorMetrics()
       syncEditorScroll()
       updateTextSelection()
     })
@@ -437,6 +641,11 @@
 
     framesOverlay.scrollTop = framesTextarea.scrollTop
     framesOverlay.scrollLeft = framesTextarea.scrollLeft
+
+    if (framesSelectionOverlay) {
+      framesSelectionOverlay.scrollTop = framesTextarea.scrollTop
+      framesSelectionOverlay.scrollLeft = framesTextarea.scrollLeft
+    }
   }
 
   function updateTextSelection() {
@@ -448,11 +657,116 @@
     selectedTextEnd = framesTextarea.selectionEnd
   }
 
+  function measureEditorMetrics() {
+    if (!framesTextarea) {
+      return
+    }
+
+    const styles = window.getComputedStyle(framesTextarea)
+    const probe = document.createElement('span')
+    probe.textContent = '0'
+    probe.style.position = 'absolute'
+    probe.style.visibility = 'hidden'
+    probe.style.whiteSpace = 'pre'
+    probe.style.font = styles.font
+    probe.style.letterSpacing = styles.letterSpacing
+    probe.style.lineHeight = styles.lineHeight
+    document.body.append(probe)
+
+    const probeRect = probe.getBoundingClientRect()
+    probe.remove()
+
+    editorMetrics = {
+      charWidth: probeRect.width || fallbackEditorMetrics.charWidth,
+      lineHeight: Number.parseFloat(styles.lineHeight) || probeRect.height || fallbackEditorMetrics.lineHeight,
+    }
+  }
+
+  function getPointerSelectionPosition(event: MouseEvent): EditorSelectionPosition | null {
+    if (!framesTextarea) {
+      return null
+    }
+
+    const styles = window.getComputedStyle(framesTextarea)
+    const textareaRect = framesTextarea.getBoundingClientRect()
+    const paddingLeft = Number.parseFloat(styles.paddingLeft) || 0
+    const paddingTop = Number.parseFloat(styles.paddingTop) || 0
+    const column = Math.max(
+      0,
+      Math.round((event.clientX - textareaRect.left + framesTextarea.scrollLeft - paddingLeft) / Math.max(editorMetrics.charWidth, 1)),
+    )
+    const lineIndex = Math.max(
+      0,
+      Math.min(
+        Math.floor((event.clientY - textareaRect.top + framesTextarea.scrollTop - paddingTop) / Math.max(editorMetrics.lineHeight, 1)),
+        Math.max(editorLines.length - 1, 0),
+      ),
+    )
+
+    return { lineIndex, column }
+  }
+
+  function stopRectangularSelectionDrag() {
+    rectangularSelectionDragAnchor = null
+    window.removeEventListener('mousemove', handleRectangularSelectionDrag)
+    window.removeEventListener('mouseup', stopRectangularSelectionDrag)
+  }
+
+  function handleRectangularSelectionDrag(event: MouseEvent) {
+    if (!rectangularSelectionDragAnchor) {
+      return
+    }
+
+    event.preventDefault()
+    const currentPosition = getPointerSelectionPosition(event)
+
+    if (!currentPosition) {
+      return
+    }
+
+    customRectangularSelection = buildRectangularSelection(editorLines, rectangularSelectionDragAnchor, currentPosition)
+  }
+
+  function handleFramesMouseDown(event: MouseEvent) {
+    if (!event.altKey || event.button !== 0) {
+      stopRectangularSelectionDrag()
+      customRectangularSelection = null
+      return
+    }
+
+    if (!framesTextarea) {
+      return
+    }
+
+    event.preventDefault()
+    stopRectangularSelectionDrag()
+    measureEditorMetrics()
+
+    const anchorPosition = getPointerSelectionPosition(event)
+
+    if (!anchorPosition) {
+      return
+    }
+
+    rectangularSelectionDragAnchor = anchorPosition
+    customRectangularSelection = null
+
+    const anchorOffset = getOffsetAtSelectionPosition(editorLines, anchorPosition)
+    selectedTextStart = anchorOffset
+    selectedTextEnd = anchorOffset
+    framesTextarea.focus()
+    framesTextarea.setSelectionRange(anchorOffset, anchorOffset)
+
+    window.addEventListener('mousemove', handleRectangularSelectionDrag)
+    window.addEventListener('mouseup', stopRectangularSelectionDrag)
+  }
+
   function rememberPendingTextEdit() {
     if (!framesTextarea) {
       return
     }
 
+    customRectangularSelection = null
     pendingTextEdit = {
       start: framesTextarea.selectionStart,
       end: framesTextarea.selectionEnd,
@@ -475,6 +789,51 @@
     syncEditorScroll()
   }
 
+  function handleFramesPaste(event: ClipboardEvent) {
+    if (!framesTextarea) {
+      return
+    }
+
+    const pastedText = event.clipboardData?.getData('text/plain') ?? ''
+
+    if (!pastedText || !containsAnsiSgr(pastedText)) {
+      return
+    }
+
+    event.preventDefault()
+    stopRectangularSelectionDrag()
+    customRectangularSelection = null
+    pendingTextEdit = null
+
+    const selectionStart = framesTextarea.selectionStart
+    const selectionEnd = framesTextarea.selectionEnd
+    const pastedContent = parseAnsiText(pastedText)
+    const insertedText = pastedContent.text
+    const nextText = `${framesText.slice(0, selectionStart)}${insertedText}${framesText.slice(selectionEnd)}`
+    const shiftedExistingSpans = shiftColorSpansForEdit(colorSpans, selectionStart, selectionEnd, insertedText.length)
+    const shiftedPastedSpans = pastedContent.spans.map((span) => ({
+      ...span,
+      start: span.start + selectionStart,
+      end: span.end + selectionStart,
+    }))
+
+    framesText = nextText
+    colorSpans = normalizeColorSpans([...shiftedExistingSpans, ...shiftedPastedSpans])
+    selectedTextStart = selectionStart + insertedText.length
+    selectedTextEnd = selectionStart + insertedText.length
+
+    queueMicrotask(() => {
+      if (framesTextarea) {
+        framesTextarea.focus()
+        framesTextarea.setSelectionRange(selectedTextStart, selectedTextEnd)
+      }
+
+      measureEditorMetrics()
+      syncEditorScroll()
+      updateTextSelection()
+    })
+  }
+
   function reselectText() {
     if (!framesTextarea) {
       return
@@ -485,12 +844,126 @@
   }
 
   function applyColorToSelection(colorId: AnsiColorId | null) {
+    if (customRectangularSelection) {
+      if (!rectangularSelectionHasColorableText) {
+        return
+      }
+
+      let nextSpans = colorSpans
+      customRectangularSelection.rows.forEach((row) => {
+        if (row.end > row.start) {
+          nextSpans = applyColorToRange(nextSpans, row.start, row.end, colorId)
+        }
+      })
+      colorSpans = nextSpans
+      reselectText()
+      return
+    }
+
     if (!selectionHasColorableText) {
       return
     }
 
     colorSpans = applyColorToRange(colorSpans, selectedTextStart, selectedTextEnd, colorId)
     reselectText()
+  }
+
+  function applyPickedColorToSelection() {
+    const palette = visibleAnsiColorOptions.length > 0 ? visibleAnsiColorOptions : basicAnsiColorOptions
+    const colorId = getClosestPaletteColorId(parseHexColor(selectedColorHex), palette)
+    applyColorToSelection(colorId)
+  }
+
+  function applyFrameGradientToSelection() {
+    if (!rectangularSelection || !canApplyFrameGradient) {
+      return
+    }
+
+    const startColor = parseHexColor(gradientStartColorHex)
+    const endColor = parseHexColor(gradientEndColorHex)
+    const palette = visibleAnsiColorOptions.length > 0 ? visibleAnsiColorOptions : basicAnsiColorOptions
+    const colorableRows = rectangularSelection.rows.filter(
+      (row) => row.end > row.start && /\S/u.test(framesText.slice(row.start, row.end)),
+    )
+    const orderedRows =
+      rectangularSelection.anchorLineIndex <= rectangularSelection.focusLineIndex
+        ? colorableRows
+        : [...colorableRows].reverse()
+    const rowCount = orderedRows.length
+    let nextSpans = colorSpans
+
+    orderedRows.forEach((row, rowIndex) => {
+      const factor = rowCount === 1 ? 0 : rowIndex / (rowCount - 1)
+      const interpolatedColor = interpolateRgbColor(startColor, endColor, factor)
+      const colorId = getClosestPaletteColorId(interpolatedColor, palette)
+      nextSpans = applyColorToRange(nextSpans, row.start, row.end, colorId)
+    })
+
+    colorSpans = nextSpans
+    reselectText()
+  }
+
+  function encodeShareState(state: ShareState) {
+    const bytes = new TextEncoder().encode(JSON.stringify(state))
+    let binary = ''
+
+    for (let index = 0; index < bytes.length; index += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000))
+    }
+
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/u, '')
+  }
+
+  function decodeShareState(value: string): ShareState | null {
+    try {
+      const normalized = value.replace(/-/g, '+').replace(/_/g, '/')
+      const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4)
+      const binary = atob(padded)
+      const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0))
+      const parsed = JSON.parse(new TextDecoder().decode(bytes)) as Partial<ShareState>
+
+      if (parsed.version !== 1 || typeof parsed.framesText !== 'string' || !Array.isArray(parsed.colorSpans)) {
+        return null
+      }
+
+      return {
+        version: 1,
+        framesText: parsed.framesText,
+        colorSpans: normalizeColorSpans(
+          parsed.colorSpans.filter(
+            (span): span is ColorSpan =>
+              typeof span?.start === 'number' && typeof span?.end === 'number' && typeof span?.colorId === 'string',
+          ),
+        ),
+        intervalMs:
+          typeof parsed.intervalMs === 'number' && Number.isFinite(parsed.intervalMs)
+            ? Math.max(10, parsed.intervalMs)
+            : starterPreset.interval,
+        ansiPaletteMode: parsed.ansiPaletteMode === '16' ? '16' : '256',
+      }
+    } catch {
+      return null
+    }
+  }
+
+  function applyShareState(state: ShareState) {
+    framesText = state.framesText
+    colorSpans = normalizeColorSpans(state.colorSpans)
+    intervalMs = state.intervalMs
+    ansiPaletteMode = state.ansiPaletteMode
+    selectedTextStart = 0
+    selectedTextEnd = 0
+    customRectangularSelection = null
+
+    queueMicrotask(() => {
+      if (framesTextarea) {
+        framesTextarea.setSelectionRange(0, 0)
+      }
+
+      measureEditorMetrics()
+      syncEditorScroll()
+      updateTextSelection()
+    })
   }
 
   function getPaletteForCategory(categoryId: BankCategoryId) {
@@ -573,24 +1046,53 @@
     }
   }
 
-  async function copyAnsiFrames() {
-    clearCopyTimer()
-
-    if (rawAnsiFrames.length === 0) {
-      copyStatus = 'no frames to copy'
-      return
-    }
+  function fallbackCopyText(value: string) {
+    const textarea = document.createElement('textarea')
+    textarea.value = value
+    textarea.setAttribute('readonly', 'true')
+    textarea.style.position = 'fixed'
+    textarea.style.opacity = '0'
+    textarea.style.pointerEvents = 'none'
+    document.body.append(textarea)
+    textarea.select()
+    textarea.setSelectionRange(0, textarea.value.length)
 
     try {
-      await navigator.clipboard.writeText(rawAnsiFrames.join('\n'))
-      copyStatus = 'copied ansi frames'
+      return document.execCommand('copy')
+    } finally {
+      textarea.remove()
+    }
+  }
+
+  async function copyTextToClipboard(value: string) {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value)
+        return true
+      }
     } catch {
-      copyStatus = 'clipboard write failed'
+      // fall through to execCommand fallback
     }
 
+    return fallbackCopyText(value)
+  }
+
+  function setCopyStatus(value: string) {
+    clearCopyTimer()
+    copyStatus = value
     copyTimer = setTimeout(() => {
       copyStatus = ''
     }, 2000)
+  }
+
+  async function copyAnsiFrames() {
+    if (rawAnsiFrames.length === 0) {
+      setCopyStatus('no frames to copy')
+      return
+    }
+
+    const didCopy = await copyTextToClipboard(rawAnsiFrames.join('\n'))
+    setCopyStatus(didCopy ? 'copied ansi frames' : 'clipboard write failed')
   }
 
   function getPresetFrame(preset: CliSpinnerPreset, clock: number) {
@@ -602,18 +1104,35 @@
   }
 
   onMount(() => {
+    const handleWindowResize = () => {
+      measureEditorMetrics()
+    }
+
+    const shareHash = new URLSearchParams(window.location.hash.slice(1)).get('s')
+    const sharedState = shareHash ? decodeShareState(shareHash) : null
+
+    if (sharedState) {
+      applyShareState(sharedState)
+    }
+
+    hasLoadedUrlState = true
     presetClock = Date.now()
     presetTimer = setInterval(() => {
       presetClock = Date.now()
     }, 40)
 
     queueMicrotask(() => {
+      measureEditorMetrics()
       syncEditorScroll()
       updateTextSelection()
     })
 
+    window.addEventListener('resize', handleWindowResize)
+
     return () => {
+      window.removeEventListener('resize', handleWindowResize)
       clearPresetTimer()
+      stopRectangularSelectionDrag()
     }
   })
 
@@ -622,12 +1141,26 @@
   }
 
   $: frameRanges = parseFrameRanges(framesText)
+  $: editorLines = parseEditorLines(framesText)
+  $: editorLongestLineLength = editorLines.reduce((longest, line) => Math.max(longest, line.text.length), 0)
+  $: editorContentWidth = Math.max(1, editorLongestLineLength, customRectangularSelection?.columnEnd ?? 0) * editorMetrics.charWidth
+  $: editorContentHeight = Math.max(1, editorLines.length) * editorMetrics.lineHeight
   $: frames = frameRanges.map(({ text }) => text)
   $: frameSignature = frames.join('\n')
   $: editorSegments = buildStyledSegments(framesText, colorSpans)
   $: rawAnsiFrames = frameRanges.map(({ start, end }) => toAnsiString(framesText, colorSpans, start, end))
   $: selectedText = framesText.slice(selectedTextStart, selectedTextEnd)
   $: selectionHasColorableText = /\S/u.test(selectedText)
+  $: rectangularSelection = customRectangularSelection ?? getRectangularSelection(framesText, selectedTextStart, selectedTextEnd)
+  $: rectangularSelectionCharacterCount =
+    rectangularSelection?.rows.reduce((total, row) => total + (row.end - row.start), 0) ?? 0
+  $: rectangularSelectionColumnCount =
+    rectangularSelection ? rectangularSelection.columnEnd - rectangularSelection.columnStart : 0
+  $: rectangularSelectionColorableRowCount =
+    rectangularSelection?.rows.filter(({ start, end }) => /\S/u.test(framesText.slice(start, end))).length ?? 0
+  $: rectangularSelectionHasColorableText = rectangularSelectionColorableRowCount > 0
+  $: showSelectionTools = selectionHasColorableText || rectangularSelectionHasColorableText
+  $: canApplyFrameGradient = rectangularSelectionColorableRowCount > 1 && rectangularSelectionCharacterCount > 0
   $: visibleAnsiColorOptions = ansiPaletteMode === '16' ? basicAnsiColorOptions : xtermAnsiColorOptions
   $: bankFilters = [
     { id: 'all', label: 'all' },
@@ -640,6 +1173,20 @@
       ? presetSpinners
       : presetSpinners.filter((preset) => preset.category === selectedPresetCategory)
   $: safeInterval = Number.isFinite(intervalMs) ? Math.max(10, intervalMs) : starterPreset.interval
+  $: shareStateHash = encodeShareState({
+    version: 1,
+    framesText,
+    colorSpans,
+    intervalMs: safeInterval,
+    ansiPaletteMode,
+  })
+  $: if (hasLoadedUrlState && typeof window !== 'undefined') {
+    const nextHash = `#s=${shareStateHash}`
+
+    if (window.location.hash !== nextHash) {
+      window.history.replaceState(null, '', nextHash)
+    }
+  }
   $: if (frames.length === 0) {
     previewIndex = 0
   }
@@ -668,6 +1215,7 @@
     clearTimer()
     clearPresetTimer()
     clearCopyTimer()
+    stopRectangularSelectionDrag()
   })
 </script>
 
@@ -792,13 +1340,31 @@
           {/if}
         </div>
 
+        <div class="editor-selection-overlay" bind:this={framesSelectionOverlay} aria-hidden="true">
+          <div class="editor-selection-content" style:width={`${editorContentWidth}px`} style:height={`${editorContentHeight}px`}>
+            {#if customRectangularSelection}
+              {#each customRectangularSelection.rows as row}
+                <div
+                  class="selection-rect"
+                  style:top={`${row.lineIndex * editorMetrics.lineHeight}px`}
+                  style:left={`${customRectangularSelection.columnStart * editorMetrics.charWidth}px`}
+                  style:width={`${(customRectangularSelection.columnEnd - customRectangularSelection.columnStart) * editorMetrics.charWidth}px`}
+                  style:height={`${editorMetrics.lineHeight}px`}
+                ></div>
+              {/each}
+            {/if}
+          </div>
+        </div>
+
         <textarea
           bind:this={framesTextarea}
           class="frames-editor"
           value={framesText}
           spellcheck="false"
           wrap="off"
+          onmousedown={handleFramesMouseDown}
           onbeforeinput={rememberPendingTextEdit}
+          onpaste={handleFramesPaste}
           oninput={handleFramesInput}
           onscroll={syncEditorScroll}
           onselect={updateTextSelection}
@@ -807,7 +1373,7 @@
         ></textarea>
       </div>
 
-      {#if selectionHasColorableText}
+      {#if showSelectionTools}
         <div class="ansi-picker">
           <div class="ansi-mode-toggle" aria-label="ansi palette mode">
             <button
@@ -828,42 +1394,71 @@
             </button>
           </div>
 
-          <div class="ansi-color-grid" class:ansi-color-grid-256={ansiPaletteMode === '256'} aria-label="ansi color tools">
-            <button
-              type="button"
-              class="ansi-color-tile ansi-color-clear"
-              title="clear color"
-              aria-label="clear color"
-              onmousedown={(event) => event.preventDefault()}
-              onclick={() => applyColorToSelection(null)}
-            >
-              <span aria-hidden="true">×</span>
-            </button>
+          <div class="color-tool-row">
+            <label class="color-input-field">
+              <span>color</span>
+              <input type="color" bind:value={selectedColorHex} />
+            </label>
 
-            {#each visibleAnsiColorOptions as color}
+            <div class="color-tool-actions">
+              <button type="button" onmousedown={(event) => event.preventDefault()} onclick={applyPickedColorToSelection}>
+                apply color
+              </button>
               <button
                 type="button"
-                class="ansi-color-tile"
-                title={color.label}
-                aria-label={color.label}
                 onmousedown={(event) => event.preventDefault()}
-                onclick={() => applyColorToSelection(color.id)}
+                onclick={() => applyColorToSelection(null)}
               >
-                <span class="ansi-swatch" aria-hidden="true" style:background={color.cssColor}></span>
+                clear
               </button>
-            {/each}
+            </div>
           </div>
+
+          {#if (rectangularSelection?.rows.length ?? 0) > 1}
+            <div class="gradient-controls">
+              <div class="gradient-stop-controls">
+                <label class="color-input-field">
+                  <span>start</span>
+                  <input type="color" bind:value={gradientStartColorHex} />
+                </label>
+                <label class="color-input-field">
+                  <span>end</span>
+                  <input type="color" bind:value={gradientEndColorHex} />
+                </label>
+              </div>
+
+              <button
+                type="button"
+                onmousedown={(event) => event.preventDefault()}
+                onclick={applyFrameGradientToSelection}
+                disabled={!canApplyFrameGradient}
+              >
+                frame gradient
+              </button>
+            </div>
+          {/if}
         </div>
       {/if}
 
       <p class="section-note">
-        {#if selectionHasColorableText}
+        {#if customRectangularSelection}
+          {customRectangularSelection.rows.length} line{customRectangularSelection.rows.length === 1 ? '' : 's'} × {rectangularSelectionColumnCount} column{rectangularSelectionColumnCount === 1 ? '' : 's'} box selected.
+        {:else if canApplyFrameGradient}
+          {rectangularSelectionColorableRowCount} colorable line{rectangularSelectionColorableRowCount === 1 ? '' : 's'} across {rectangularSelectionColumnCount} column{rectangularSelectionColumnCount === 1 ? '' : 's'} selected for frame gradient.
+        {:else if selectionHasColorableText}
           {selectedTextEnd - selectedTextStart} character{selectedTextEnd - selectedTextStart === 1 ? '' : 's'} selected.
         {:else if selectedTextEnd > selectedTextStart}
           whitespace-only selections do not get color controls.
         {:else}
-          select characters in the editor to color them.
+          select characters in the editor to color them, or hold option and drag to box-select.
         {/if}
+        {#if (rectangularSelection?.rows.length ?? 0) > 1 && !customRectangularSelection}
+          Multiline frame gradients use a rectangular block between the selection endpoints.
+        {/if}
+        {#if showSelectionTools}
+          Colors are approximated to the nearest {ansiPaletteMode === '16' ? '16-color' : '256-color'} ANSI value when applied. {ansiPaletteMode === '16' ? 'Switch to 256 for smoother gradients.' : ''}
+        {/if}
+        {#if canApplyFrameGradient} Blank rows inside the box are skipped, and the gradient follows your drag direction.{/if}
         {#if copyStatus} {copyStatus}.{/if}
       </p>
       <div class="filter-list">
@@ -1021,43 +1616,34 @@
     background: var(--surface);
   }
 
-  .ansi-color-grid {
+  .color-tool-row,
+  .gradient-controls,
+  .gradient-stop-controls,
+  .color-tool-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    align-items: end;
+  }
+
+  .color-input-field {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(2rem, 2rem));
-    gap: 0.5rem;
-  }
-
-  .ansi-color-grid-256 {
-    grid-template-columns: repeat(auto-fill, minmax(1.25rem, 1.25rem));
     gap: 0.35rem;
-    max-height: 11rem;
-    overflow: auto;
-    padding-right: 0.25rem;
   }
 
-  .ansi-color-tile {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 2rem;
+  .color-input-field span {
+    color: var(--muted);
+    font-size: 0.875rem;
+    text-transform: lowercase;
+  }
+
+  .color-input-field input[type='color'] {
+    width: 3rem;
     height: 2rem;
     padding: 0;
-  }
-
-  .ansi-color-grid-256 .ansi-color-tile {
-    width: 1.25rem;
-    height: 1.25rem;
-  }
-
-  .ansi-swatch {
-    display: inline-block;
-    width: 100%;
-    height: 100%;
-    border: 1px solid color-mix(in oklch, var(--text) 35%, transparent);
-  }
-
-  .ansi-color-clear {
-    color: var(--muted);
+    background: transparent;
+    border: 1px solid var(--border);
+    cursor: pointer;
   }
 
   .editor-shell {
@@ -1067,6 +1653,7 @@
   }
 
   .editor-overlay,
+  .editor-selection-overlay,
   .frames-editor {
     width: 100%;
     min-height: 22rem;
@@ -1076,17 +1663,38 @@
     white-space: pre;
   }
 
-  .editor-overlay {
+  .editor-overlay,
+  .editor-selection-overlay {
     position: absolute;
     inset: 0;
     overflow: auto;
-    color: var(--text);
     pointer-events: none;
     scrollbar-width: none;
   }
 
-  .editor-overlay::-webkit-scrollbar {
+  .editor-overlay {
+    color: var(--text);
+  }
+
+  .editor-overlay::-webkit-scrollbar,
+  .editor-selection-overlay::-webkit-scrollbar {
     display: none;
+  }
+
+  .editor-selection-overlay {
+    z-index: 2;
+  }
+
+  .editor-selection-content {
+    position: relative;
+    min-width: 100%;
+    min-height: 100%;
+  }
+
+  .selection-rect {
+    position: absolute;
+    background: color-mix(in oklch, var(--text) 14%, transparent);
+    outline: 1px solid color-mix(in oklch, var(--text) 28%, transparent);
   }
 
   .frames-editor {
