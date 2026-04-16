@@ -613,6 +613,7 @@
   let copyTimer: ReturnType<typeof setTimeout> | null = null
   let hasLoadedUrlState = false
   let shareStateHash = ''
+  let lastLoadedShareStateHash = ''
 
   function setFrames(nextFrames: string[]) {
     clearCopyTimer()
@@ -966,6 +967,36 @@
     })
   }
 
+  function getShareStateHashFromLocation() {
+    if (typeof window === 'undefined') {
+      return ''
+    }
+
+    if (window.location.hash.startsWith('#s=')) {
+      return window.location.hash.slice(3)
+    }
+
+    return new URLSearchParams(window.location.hash.replace(/^#/, '')).get('s') ?? ''
+  }
+
+  function loadShareStateFromLocation() {
+    const shareHash = getShareStateHashFromLocation()
+
+    if (!shareHash || shareHash === lastLoadedShareStateHash) {
+      return false
+    }
+
+    const sharedState = decodeShareState(shareHash)
+
+    if (!sharedState) {
+      return false
+    }
+
+    lastLoadedShareStateHash = shareHash
+    applyShareState(sharedState)
+    return true
+  }
+
   function getPaletteForCategory(categoryId: BankCategoryId) {
     if (categoryId === 'all') {
       return unique([...builtInCharacters, ...customCharacters])
@@ -1108,13 +1139,11 @@
       measureEditorMetrics()
     }
 
-    const shareHash = new URLSearchParams(window.location.hash.slice(1)).get('s')
-    const sharedState = shareHash ? decodeShareState(shareHash) : null
-
-    if (sharedState) {
-      applyShareState(sharedState)
+    const handleHashChange = () => {
+      loadShareStateFromLocation()
     }
 
+    loadShareStateFromLocation()
     hasLoadedUrlState = true
     presetClock = Date.now()
     presetTimer = setInterval(() => {
@@ -1128,9 +1157,11 @@
     })
 
     window.addEventListener('resize', handleWindowResize)
+    window.addEventListener('hashchange', handleHashChange)
 
     return () => {
       window.removeEventListener('resize', handleWindowResize)
+      window.removeEventListener('hashchange', handleHashChange)
       clearPresetTimer()
       stopRectangularSelectionDrag()
     }
@@ -1184,6 +1215,7 @@
     const nextHash = `#s=${shareStateHash}`
 
     if (window.location.hash !== nextHash) {
+      lastLoadedShareStateHash = shareStateHash
       window.history.replaceState(null, '', nextHash)
     }
   }
