@@ -98,6 +98,35 @@
     ansiPaletteMode: AnsiPaletteMode
   }
 
+  type CompactColorSpan = [gapFromPreviousEnd: number, length: number, color: number]
+
+  type CompactShareState = {
+    v: 1
+    t: string
+    s: CompactColorSpan[]
+    i: number
+    m: 0 | 1
+  }
+
+  const basicShareColorIds = [
+    'black',
+    'gray',
+    'red',
+    'brightRed',
+    'yellow',
+    'brightYellow',
+    'green',
+    'brightGreen',
+    'cyan',
+    'brightCyan',
+    'blue',
+    'brightBlue',
+    'magenta',
+    'brightMagenta',
+    'white',
+    'brightWhite',
+  ] as const
+
   const fallbackEditorMetrics: EditorMetrics = {
     charWidth: 8,
     lineHeight: 22,
@@ -612,8 +641,9 @@
   let copyStatus = ''
   let copyTimer: ReturnType<typeof setTimeout> | null = null
   let hasLoadedUrlState = false
-  let shareStateHash = ''
   let lastLoadedShareStateHash = ''
+  let shareStateSyncTimer: ReturnType<typeof setTimeout> | null = null
+  let shareStateSyncToken = 0
 
   function setFrames(nextFrames: string[]) {
     clearCopyTimer()
@@ -904,8 +934,7 @@
     reselectText()
   }
 
-  function encodeShareState(state: ShareState) {
-    const bytes = new TextEncoder().encode(JSON.stringify(state))
+  function bytesToBase64Url(bytes: Uint8Array) {
     let binary = ''
 
     for (let index = 0; index < bytes.length; index += 0x8000) {
@@ -915,13 +944,20 @@
     return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/u, '')
   }
 
-  function decodeShareState(value: string): ShareState | null {
+  function base64UrlToBytes(value: string) {
+    const normalized = value.replace(/-/g, '+').replace(/_/g, '/')
+    const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4)
+    const binary = atob(padded)
+    return Uint8Array.from(binary, (character) => character.charCodeAt(0))
+  }
+
+  function encodeLegacyShareState(state: ShareState) {
+    return bytesToBase64Url(new TextEncoder().encode(JSON.stringify(state)))
+  }
+
+  function decodeLegacyShareState(value: string): ShareState | null {
     try {
-      const normalized = value.replace(/-/g, '+').replace(/_/g, '/')
-      const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4)
-      const binary = atob(padded)
-      const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0))
-      const parsed = JSON.parse(new TextDecoder().decode(bytes)) as Partial<ShareState>
+      const parsed = JSON.parse(new TextDecoder().decode(base64UrlToBytes(value))) as Partial<ShareState>
 
       if (parsed.version !== 1 || typeof parsed.framesText !== 'string' || !Array.isArray(parsed.colorSpans)) {
         return null
@@ -947,6 +983,148 @@
     }
   }
 
+  function encodeCompactColorId(colorId: AnsiColorId) {
+    if (colorId.startsWith('xterm')) {
+      const paletteIndex = Number.parseInt(colorId.slice(5), 10)
+      return Number.isFinite(paletteIndex) ? Math.max(0, Math.min(255, paletteIndex)) : 0
+    }
+
+    const basicIndex = basicShareColorIds.indexOf(colorId as (typeof basicShareColorIds)[number])
+    return basicIndex >= 0 ? -(basicIndex + 1) : 0
+  }
+
+  function decodeCompactColorId(value: number): AnsiColorId | null {
+    if (value >= 0) {
+      return `xterm${Math.max(0, Math.min(255, Math.trunc(value)))}`
+    }
+
+    return basicShareColorIds[-Math.trunc(value) - 1] ?? null
+  }
+
+  function encodeCompactShareState(state: ShareState): CompactShareState {
+    const spans = normalizeColorSpans(state.colorSpans)
+    let previousEnd = 0
+
+    return {
+      v: 1,
+      t: state.framesText,
+      s: spans.map((span) => {
+        const compactSpan: CompactColorSpan = [
+          Math.max(0, span.start - previousEnd),
+          Math.max(0, span.end - span.start),
+          encodeCompactColorId(span.colorId),
+        ]
+        previousEnd = span.end
+        return compactSpan
+      }),
+      i: state.intervalMs,
+      m: state.ansiPaletteMode === '16' ? 0 : 1,
+    }
+  }
+
+  function decodeCompactShareState(value: string): ShareState | null {
+    try {
+      const parsed = JSON.parse(value) as Partial<CompactShareState>
+
+      if (parsed.v !== 1 || typeof parsed.t !== 'string' || !Array.isArray(parsed.s)) {
+        return null
+      }
+
+      const spans: ColorSpan[] = []
+      let previousEnd = 0
+
+      for (const row of parsed.s) {
+        if (!Array.isArray(row) || row.length < 3) {
+          continue
+        }
+
+        const gap = Number(row[0])
+        const length = Number(row[1])
+        const encodedColor = Number(row[2])
+
+        if (!Number.isFinite(gap) || !Number.isFinite(length) || !Number.isFinite(encodedColor)) {
+          continue
+        }
+
+        const start = previousEnd + Math.max(0, Math.trunc(gap))
+        const end = start + Math.max(0, Math.trunc(length))
+        previousEnd = end
+
+        const colorId = decodeCompactColorId(encodedColor)
+
+        if (colorId && end > start) {
+          spans.push({ start, end, colorId })
+        }
+      }
+
+      return {
+        version: 1,
+        framesText: parsed.t,
+        colorSpans: normalizeColorSpans(spans),
+        intervalMs: typeof parsed.i === 'number' && Number.isFinite(parsed.i) ? Math.max(10, parsed.i) : starterPreset.interval,
+        ansiPaletteMode: parsed.m === 0 ? '16' : '256',
+      }
+    } catch {
+      return null
+    }
+  }
+
+  async function compressString(value: string) {
+    if (typeof window === 'undefined' || typeof CompressionStream === 'undefined') {
+      return null
+    }
+
+    try {
+      const input = new TextEncoder().encode(value)
+      const stream = new Blob([input]).stream().pipeThrough(new CompressionStream('deflate-raw'))
+      const compressed = new Uint8Array(await new Response(stream).arrayBuffer())
+      return bytesToBase64Url(compressed)
+    } catch {
+      return null
+    }
+  }
+
+  async function decompressString(value: string) {
+    if (typeof window === 'undefined' || typeof DecompressionStream === 'undefined') {
+      return null
+    }
+
+    try {
+      const input = base64UrlToBytes(value)
+      const stream = new Blob([input]).stream().pipeThrough(new DecompressionStream('deflate-raw'))
+      return await new Response(stream).text()
+    } catch {
+      return null
+    }
+  }
+
+  async function encodeShareLocationHash(state: ShareState) {
+    const legacyHash = `#s=${encodeLegacyShareState(state)}`
+    const compactPayload = JSON.stringify(encodeCompactShareState(state))
+    const compressedPayload = await compressString(compactPayload)
+
+    if (!compressedPayload) {
+      return legacyHash
+    }
+
+    return `#z=${compressedPayload}`
+  }
+
+  async function decodeCompressedShareState(value: string) {
+    const decompressed = await decompressString(value)
+    return decompressed ? decodeCompactShareState(decompressed) : null
+  }
+
+  function buildShareState(): ShareState {
+    return {
+      version: 1,
+      framesText,
+      colorSpans: normalizeColorSpans(colorSpans),
+      intervalMs: safeInterval,
+      ansiPaletteMode,
+    }
+  }
+
   function applyShareState(state: ShareState) {
     framesText = state.framesText
     colorSpans = normalizeColorSpans(state.colorSpans)
@@ -969,32 +1147,90 @@
 
   function getShareStateHashFromLocation() {
     if (typeof window === 'undefined') {
-      return ''
+      return { format: null as 's' | 'z' | null, value: '', locationHash: '' }
+    }
+
+    if (window.location.hash.startsWith('#z=')) {
+      return { format: 'z' as const, value: window.location.hash.slice(3), locationHash: window.location.hash }
     }
 
     if (window.location.hash.startsWith('#s=')) {
-      return window.location.hash.slice(3)
+      return { format: 's' as const, value: window.location.hash.slice(3), locationHash: window.location.hash }
     }
 
-    return new URLSearchParams(window.location.hash.replace(/^#/, '')).get('s') ?? ''
+    const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''))
+    const compressedHash = hashParams.get('z')
+
+    if (compressedHash) {
+      return { format: 'z' as const, value: compressedHash, locationHash: window.location.hash }
+    }
+
+    return {
+      format: 's' as const,
+      value: hashParams.get('s') ?? '',
+      locationHash: window.location.hash,
+    }
   }
 
-  function loadShareStateFromLocation() {
-    const shareHash = getShareStateHashFromLocation()
+  async function loadShareStateFromLocation() {
+    const { format, value, locationHash } = getShareStateHashFromLocation()
 
-    if (!shareHash || shareHash === lastLoadedShareStateHash) {
+    if (!format || !value || locationHash === lastLoadedShareStateHash) {
       return false
     }
 
-    const sharedState = decodeShareState(shareHash)
+    const sharedState = format === 'z' ? await decodeCompressedShareState(value) : decodeLegacyShareState(value)
 
     if (!sharedState) {
       return false
     }
 
-    lastLoadedShareStateHash = shareHash
+    lastLoadedShareStateHash = locationHash
     applyShareState(sharedState)
+
+    if (format === 's' && typeof window !== 'undefined') {
+      const compressedHash = await encodeShareLocationHash(sharedState)
+
+      if (compressedHash.startsWith('#z=') && window.location.hash !== compressedHash) {
+        lastLoadedShareStateHash = compressedHash
+        window.history.replaceState(null, '', compressedHash)
+      }
+    }
+
     return true
+  }
+
+  function clearShareStateSyncTimer() {
+    if (shareStateSyncTimer) {
+      clearTimeout(shareStateSyncTimer)
+      shareStateSyncTimer = null
+    }
+  }
+
+  function queueUrlStateSync() {
+    clearShareStateSyncTimer()
+    shareStateSyncToken += 1
+    const syncToken = shareStateSyncToken
+
+    shareStateSyncTimer = setTimeout(() => {
+      shareStateSyncTimer = null
+      void syncUrlState(syncToken)
+    }, 150)
+  }
+
+  async function syncUrlState(syncToken: number) {
+    if (!hasLoadedUrlState || typeof window === 'undefined' || syncToken !== shareStateSyncToken) {
+      return
+    }
+
+    const nextHash = await encodeShareLocationHash(buildShareState())
+
+    if (syncToken !== shareStateSyncToken || !nextHash || window.location.hash === nextHash) {
+      return
+    }
+
+    lastLoadedShareStateHash = nextHash
+    window.history.replaceState(null, '', nextHash)
   }
 
   function getPaletteForCategory(categoryId: BankCategoryId) {
@@ -1140,11 +1376,9 @@
     }
 
     const handleHashChange = () => {
-      loadShareStateFromLocation()
+      void loadShareStateFromLocation()
     }
 
-    loadShareStateFromLocation()
-    hasLoadedUrlState = true
     presetClock = Date.now()
     presetTimer = setInterval(() => {
       presetClock = Date.now()
@@ -1156,6 +1390,11 @@
       updateTextSelection()
     })
 
+    void (async () => {
+      await loadShareStateFromLocation()
+      hasLoadedUrlState = true
+    })()
+
     window.addEventListener('resize', handleWindowResize)
     window.addEventListener('hashchange', handleHashChange)
 
@@ -1164,6 +1403,7 @@
       window.removeEventListener('hashchange', handleHashChange)
       clearPresetTimer()
       stopRectangularSelectionDrag()
+      clearShareStateSyncTimer()
     }
   })
 
@@ -1204,20 +1444,12 @@
       ? presetSpinners
       : presetSpinners.filter((preset) => preset.category === selectedPresetCategory)
   $: safeInterval = Number.isFinite(intervalMs) ? Math.max(10, intervalMs) : starterPreset.interval
-  $: shareStateHash = encodeShareState({
-    version: 1,
-    framesText,
-    colorSpans,
-    intervalMs: safeInterval,
-    ansiPaletteMode,
-  })
   $: if (hasLoadedUrlState && typeof window !== 'undefined') {
-    const nextHash = `#s=${shareStateHash}`
-
-    if (window.location.hash !== nextHash) {
-      lastLoadedShareStateHash = shareStateHash
-      window.history.replaceState(null, '', nextHash)
-    }
+    framesText
+    colorSpans
+    safeInterval
+    ansiPaletteMode
+    queueUrlStateSync()
   }
   $: if (frames.length === 0) {
     previewIndex = 0
@@ -1247,6 +1479,7 @@
     clearTimer()
     clearPresetTimer()
     clearCopyTimer()
+    clearShareStateSyncTimer()
     stopRectangularSelectionDrag()
   })
 </script>
