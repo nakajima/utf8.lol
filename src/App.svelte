@@ -89,6 +89,7 @@
   }
 
   type AnsiPaletteMode = '16' | '256'
+  type Theme = 'dark' | 'light'
 
   type ShareState = {
     version: 1
@@ -644,6 +645,20 @@
   let lastLoadedShareStateHash = ''
   let shareStateSyncTimer: ReturnType<typeof setTimeout> | null = null
   let shareStateSyncToken = 0
+  let theme: Theme =
+    typeof document !== 'undefined' && document.documentElement.dataset.theme === 'light' ? 'light' : 'dark'
+
+  function toggleTheme() {
+    const nextTheme: Theme = theme === 'dark' ? 'light' : 'dark'
+    theme = nextTheme
+    document.documentElement.dataset.theme = nextTheme
+
+    try {
+      localStorage.setItem('utf8-theme', nextTheme)
+    } catch {
+      // Keep the selected theme for this page when storage is unavailable.
+    }
+  }
 
   function setFrames(nextFrames: string[]) {
     clearCopyTimer()
@@ -1490,8 +1505,23 @@
 
 <section class="page">
   <header class="header">
-    <h1>utf8.lol</h1>
-    <p class="intro">make the text go round and round. <a href="https://github.com/nakajima/utf8.lol">view source</a></p>
+    <div>
+      <h1>utf8.lol</h1>
+      <p class="intro">make the text go round and round. <a href="https://github.com/nakajima/utf8.lol">view source</a></p>
+    </div>
+		<div style="text-align: right">
+		<button
+      class="theme-toggle"
+      type="button"
+      aria-label={`switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
+      onclick={toggleTheme}
+    >
+      {theme === 'dark' ? 'light mode' : 'dark mode'}
+    </button>
+		{#if theme === 'light'}
+		<p style="font-size: 12px; color: #bbb">light mode is for sickos</p>
+		{/if}
+		</div>
   </header>
 
   <section class="preview-row">
@@ -1777,8 +1807,16 @@
   }
 
   .header {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    align-items: flex-start;
     padding-top: 0;
     border-top: 0;
+  }
+
+  .theme-toggle {
+    flex: none;
   }
 
   .preview-row {

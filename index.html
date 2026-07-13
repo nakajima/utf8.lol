@@ -7,6 +7,12 @@
     <link rel="apple-touch-icon" href="/apple-touch-icon.png?v=2" sizes="180x180" />
     <link rel="shortcut icon" href="/favicon.ico?v=2" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      try {
+        const theme = localStorage.getItem('utf8-theme')
+        if (theme === 'light') document.documentElement.dataset.theme = theme
+      } catch {}
+    </script>
     <title>utf8.lol</title>
   </head>
   <body>

@@ -8,7 +8,7 @@
     ui-monospace, "SFMono-Regular", "SF Mono", Consolas, "Liberation Mono",
     Menlo, monospace;
 
-  color-scheme: light dark;
+  color-scheme: dark;
   font-family: var(--font);
   line-height: 1.4;
   font-weight: 400;
@@ -18,6 +18,16 @@
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+:root[data-theme="light"] {
+  --bg: oklch(98% 0.008 246);
+  --text: oklch(20% 0.035 246);
+  --muted: oklch(47% 0.025 246);
+  --border: oklch(82% 0.02 246);
+  --surface: oklch(94% 0.012 246);
+
+  color-scheme: light;
 }
 
 * {
